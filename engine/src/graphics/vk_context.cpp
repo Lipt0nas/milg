@@ -161,6 +161,7 @@ namespace milg::graphics {
         vulkan_12_features.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
         vulkan_12_features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
         vulkan_12_features.hostQueryReset                               = VK_TRUE;
+        vulkan_12_features.uniformAndStorageBuffer8BitAccess            = VK_TRUE;
 
         VkPhysicalDeviceVulkan13Features vulkan_13_features = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,

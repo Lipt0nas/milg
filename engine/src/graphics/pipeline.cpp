@@ -105,17 +105,30 @@ namespace milg::graphics {
     Pipeline *PipelineFactory::create_compute_pipeline(
         const std::string &name, const std::string &shader_id,
         const std::initializer_list<PipelineOutputDescription> &output_descriptions, uint32_t texture_input_count,
-        uint32_t push_constant_size) {
+        uint32_t buffer_input_count, uint32_t push_constant_size) {
         if (m_pipelines.find(name) != m_pipelines.end()) {
             MILG_ERROR("Pipeline with name {} already exists", name);
             return nullptr;
         }
 
         std::vector<VkDescriptorSetLayoutBinding> texture_bindings;
+        uint32_t                                  last_binding = 0;
         for (uint32_t i = 0; i < texture_input_count; i++) {
             texture_bindings.push_back({
                 .binding            = i,
                 .descriptorType     = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .descriptorCount    = 1,
+                .stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT,
+                .pImmutableSamplers = nullptr,
+            });
+
+            last_binding = i + 1;
+        }
+
+        for (uint32_t i = 0; i < buffer_input_count; i++) {
+            texture_bindings.push_back({
+                .binding            = i + last_binding,
+                .descriptorType     = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .descriptorCount    = 1,
                 .stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT,
                 .pImmutableSamplers = nullptr,
@@ -315,6 +328,25 @@ namespace milg::graphics {
             .descriptorType   = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .pImageInfo       = &image_info,
             .pBufferInfo      = nullptr,
+            .pTexelBufferView = nullptr,
+        };
+        context->device_table().vkUpdateDescriptorSets(context->device(), 1, &write_descriptor_set, 0, nullptr);
+    }
+
+    void Pipeline::bind_buffer(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
+                               uint32_t binding, const std::shared_ptr<Buffer> &buffer) {
+        VkDescriptorBufferInfo buffer_info = {.buffer = buffer->handle(), .offset = 0, .range = buffer->size()};
+
+        VkWriteDescriptorSet write_descriptor_set = {
+            .sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext            = nullptr,
+            .dstSet           = set,
+            .dstBinding       = binding,
+            .dstArrayElement  = 0,
+            .descriptorCount  = 1,
+            .descriptorType   = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pImageInfo       = nullptr,
+            .pBufferInfo      = &buffer_info,
             .pTexelBufferView = nullptr,
         };
         context->device_table().vkUpdateDescriptorSets(context->device(), 1, &write_descriptor_set, 0, nullptr);

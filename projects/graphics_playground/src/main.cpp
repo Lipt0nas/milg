@@ -102,29 +102,29 @@ public:
         this->noise_texture    = *AssetStore::load<Texture>("textures/noise.png");
         this->light_texture    = *AssetStore::load<Texture>("textures/light.png");
 
-        this->sprite_batch = SpriteBatch::create(context, albedo_buffer->format(), 10000);
+        this->sprite_batch = SpriteBatch::create(context, albedo_buffer->format(), emissive_buffer->format(), 10000);
 
         this->pipeline_factory      = PipelineFactory::create(context);
         this->voronoi_seed_pipeline = this->pipeline_factory->create_compute_pipeline(
             "voronoi_seed", "shaders/voronoi_seed.comp.spv",
             {PipelineOutputDescription{
                 .format = VK_FORMAT_R8G8B8A8_UNORM, .width = window->width(), .height = window->height()}},
-            2);
+            2, 0);
         this->voronoi_pipeline = this->pipeline_factory->create_compute_pipeline(
             "voronoi", "shaders/voronoi.comp.spv",
             {PipelineOutputDescription{
                 .format = VK_FORMAT_R8G8B8A8_UNORM, .width = window->width(), .height = window->height()}},
-            2, sizeof(float) * 6);
+            2, 0, sizeof(float) * 6);
         this->distance_field_pipeline = this->pipeline_factory->create_compute_pipeline(
             "distance_field", "shaders/distance_field.comp.spv",
             {PipelineOutputDescription{
                 .format = VK_FORMAT_R8G8_UNORM, .width = window->width(), .height = window->height()}},
-            2);
+            2, 0);
         this->noise_seed_pipeline = this->pipeline_factory->create_compute_pipeline(
             "noise_seed", "shaders/noise_seed.comp.spv",
             {PipelineOutputDescription{
                 .format = VK_FORMAT_R8_UNORM, .width = noise_texture->width(), .height = noise_texture->height()}},
-            2, sizeof(float));
+            2, 0, sizeof(float));
         this->raytrace_pipeline = this->pipeline_factory->create_compute_pipeline(
             "raytrace", "shaders/raytrace.comp.spv",
             {PipelineOutputDescription{.format = VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -133,7 +133,7 @@ public:
              PipelineOutputDescription{.format = VK_FORMAT_R16G16B16A16_SFLOAT,
                                        .width  = static_cast<uint32_t>(window->width() * rt_scale),
                                        .height = static_cast<uint32_t>(window->height() * rt_scale)}},
-            6, sizeof(raytrace_pass_constants));
+            6, 0, sizeof(raytrace_pass_constants));
         this->rt_upscale_pipeline = this->pipeline_factory->create_compute_pipeline(
             "rt_upscale", "shaders/rt_upscale.comp.spv",
             {PipelineOutputDescription{.format = VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -141,12 +141,12 @@ public:
                                        .height = static_cast<uint32_t>(window->height() * rt_scale)},
              PipelineOutputDescription{
                  .format = VK_FORMAT_R16G16B16A16_SFLOAT, .width = window->width(), .height = window->height()}},
-            2, sizeof(rt_upscale_pass_constants));
+            2, 0, sizeof(rt_upscale_pass_constants));
         this->composite_pipeline = this->pipeline_factory->create_compute_pipeline(
             "composite", "shaders/composite.comp.spv",
             {PipelineOutputDescription{
                 .format = VK_FORMAT_R8G8B8A8_UNORM, .width = window->width(), .height = window->height()}},
-            4, sizeof(composite_pass_constants));
+            4, 0, sizeof(composite_pass_constants));
     }
 
     void on_update(float delta) override {
@@ -180,16 +180,16 @@ public:
         s.size     = {albedo_texture->width(), albedo_texture->height()};
 
         Sprite occluder;
-        occluder.position = {200, 200};
+        occluder.position = {mouse_position};
         occluder.color    = {3.0f, 3.0f, 3.0f, 1.0f};
         occluder.size     = {10, 100};
         occluder.rotation = time * 5;
-        sprite_batch->draw_sprite(occluder, light_texture);
+        sprite_batch->draw_sprite(occluder, light_texture, light_texture);
 
         occluder.rotation = (time + 180) * 5;
-        sprite_batch->draw_sprite(occluder, light_texture);
+        sprite_batch->draw_sprite(occluder, light_texture, light_texture);
 
-        sprite_batch->draw_sprite(s, albedo_texture);
+        sprite_batch->draw_sprite(s, albedo_texture, emissive_texture);
         sprite_batch->build_batches(command_buffer);
 
         const VkExtent2D extent   = {albedo_buffer->width(), albedo_buffer->height()};
@@ -520,6 +520,206 @@ public:
     }
 };
 
+#pragma pack(1)
+struct SvoNode {
+    uint8_t  is_leaf : 1;
+    uint32_t child_ptr : 31;
+    uint64_t child_mask;
+};
+
+uint64_t pack_bits_64(const uint8_t data[64]) {
+    uint64_t mask = 0;
+    for (uint32_t i = 0; i < 64; i++) {
+        uint64_t bit = data[i] != 0;
+        mask |= bit << i;
+    }
+
+    return mask;
+}
+
+void left_pack(uint8_t data[64], uint64_t mask) {
+    for (uint32_t i = 0, j = 0; mask != 0; i++) {
+        data[j] = data[i];
+        j += (mask & 1);
+        mask >>= 1;
+    }
+}
+
+SvoNode generate_svo_tree(std::vector<SvoNode> &nodes, std::vector<uint8_t> &leaf_data, int32_t scale,
+                          glm::ivec3 position) {
+    SvoNode node = {};
+
+    if (scale == 2) {
+        alignas(64) uint8_t temp[64];
+
+        for (int32_t i = 0; i < 64; i++) {
+            temp[i] = glm::linearRand(0, 1);
+        }
+        node.is_leaf    = 1;
+        node.child_mask = pack_bits_64(temp);
+
+        left_pack(temp, node.child_mask);
+        node.child_ptr = leaf_data.size();
+        leaf_data.insert(leaf_data.end(), temp, temp + std::popcount(node.child_mask));
+
+        return node;
+    }
+
+    scale -= 2;
+
+    std::vector<SvoNode> children;
+
+    for (int32_t i = 0; i < 64; i++) {
+        glm::ivec3 child_pos = i >> glm::ivec3(0, 4, 2) & 3;
+        SvoNode    child     = generate_svo_tree(nodes, leaf_data, scale, position + (child_pos << scale));
+
+        if (child.child_mask != 0) {
+            node.child_mask |= 1ull << i;
+            children.push_back(child);
+        }
+    }
+
+    node.child_ptr = nodes.size();
+    nodes.insert(nodes.end(), children.begin(), children.end());
+
+    return node;
+}
+
+class VoxelRT : public Layer {
+public:
+    struct {
+        glm::vec2 inverse_resolution = {0.0f, 0.0f};
+        glm::vec2 resolution         = {0.0f, 0.0f};
+        glm::mat4 projection         = glm::mat4(1.0f);
+        glm::vec4 position           = {0.0f, 0.0f, 0.0f, 0.0f};
+        uint32_t  node_count         = 0;
+        uint32_t  leaf_count         = 0;
+    } svo_rt_constants;
+
+    std::shared_ptr<VulkanContext> context = nullptr;
+
+    std::shared_ptr<PipelineFactory> pipeline_factory      = nullptr;
+    Pipeline                        *svo_raytrace_pipeline = nullptr;
+
+    std::shared_ptr<Buffer> svo_data      = nullptr;
+    std::shared_ptr<Buffer> svo_leaf_data = nullptr;
+
+    void on_attach() override {
+        srand(time(0));
+
+        auto &window = Application::get().window();
+        context      = Application::get().context();
+
+        pipeline_factory = PipelineFactory::create(context);
+
+        std::vector<uint8_t> leaf_data;
+        std::vector<SvoNode> nodes;
+        nodes.resize(1);
+
+        generate_svo_tree(nodes, leaf_data, 6, glm::ivec3(0, 0, 0));
+
+        MILG_INFO("leaf_data: {}\nnodes: {}", leaf_data.size(), nodes.size());
+
+        svo_rt_constants.leaf_count = leaf_data.size();
+        svo_rt_constants.node_count = nodes.size();
+        {
+            svo_data =
+                Buffer::create(context, BufferCreateInfo{
+                                            .size             = sizeof(SvoNode) * nodes.size(),
+                                            .memory_usage     = VMA_MEMORY_USAGE_AUTO,
+                                            .allocation_flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                                                VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                            .usage_flags = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                        });
+
+            uint8_t *data   = reinterpret_cast<uint8_t *>(svo_data->allocation_info().pMappedData);
+            size_t   offset = sizeof(SvoNode) * nodes.size();
+            mempcpy(data, nodes.data(), offset);
+        }
+
+        {
+            svo_leaf_data =
+                Buffer::create(context, BufferCreateInfo{
+                                            .size             = sizeof(uint8_t) * leaf_data.size(),
+                                            .memory_usage     = VMA_MEMORY_USAGE_AUTO,
+                                            .allocation_flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                                                VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                            .usage_flags = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                        });
+
+            uint8_t *data   = reinterpret_cast<uint8_t *>(svo_leaf_data->allocation_info().pMappedData);
+            size_t   offset = sizeof(uint8_t) * leaf_data.size();
+            mempcpy(data, leaf_data.data(), offset);
+        }
+
+        svo_raytrace_pipeline = pipeline_factory->create_compute_pipeline(
+            "SVO RT", "shaders/svo_rt.comp.spv",
+            {PipelineOutputDescription{
+                .format = VK_FORMAT_R8G8B8A8_UNORM, .width = window->width(), .height = window->height()}},
+            1, 2, sizeof(svo_rt_constants));
+    }
+
+    void on_update(float delta) override {
+        auto &window = Application::get().window();
+
+        auto resolution         = glm::vec2(window->width(), window->height());
+        auto inverse_resolution = glm::vec2(1.0f) / resolution;
+
+        auto command_buffer = Application::get().acquire_command_buffer();
+
+        const VkCommandBufferBeginInfo command_buffer_begin_info = {
+            .sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext            = nullptr,
+            .flags            = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        };
+
+        context->device_table().vkBeginCommandBuffer(command_buffer, &command_buffer_begin_info);
+        pipeline_factory->begin_frame(command_buffer);
+
+        {
+            auto pipeline = svo_raytrace_pipeline;
+            auto output   = pipeline->output_buffers[0];
+
+            pipeline->begin(context, command_buffer);
+            output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+
+            pipeline->bind_texture(context, command_buffer, 0, output);
+            pipeline->bind_buffer(context, command_buffer, 1, svo_data);
+            pipeline->bind_buffer(context, command_buffer, 2, svo_leaf_data);
+
+            auto projection_mat = glm::perspective(90.0f, resolution.x / resolution.y, 0.1f, 100.0f);
+            auto cam_pos        = glm::vec3(0.0, 0.0, 0.0);
+
+            svo_rt_constants.resolution         = resolution;
+            svo_rt_constants.inverse_resolution = inverse_resolution;
+            svo_rt_constants.projection         = projection_mat;
+
+            pipeline->set_push_constants(context, command_buffer, sizeof(svo_rt_constants), &svo_rt_constants);
+            context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
+                                                  dispatch_size(output->height()), 1);
+            pipeline->end(context, command_buffer);
+
+            output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            Application::get().swapchain()->blit_to_current_image(
+                command_buffer, output->handle(), {.width = output->width(), .height = output->height()});
+        }
+
+        pipeline_factory->end_frame(command_buffer);
+        context->device_table().vkEndCommandBuffer(command_buffer);
+
+        ImGui::Begin("Debug");
+        { ImGui::DragFloat4("Position", &svo_rt_constants.position.x); }
+        ImGui::End();
+    }
+
+    void on_detach() override {
+    }
+
+    void on_event(Event &e) override {
+    }
+};
+
 class GraphicsPlayground : public Application {
 public:
     GraphicsPlayground(int argc, char **argv, const WindowCreateInfo &window_info)
@@ -529,7 +729,8 @@ public:
         AssetStore::add_search_path((bindir / "data").lexically_normal());
         AssetStore::add_search_path(ASSET_DIR);
 
-        push_layer(new RTLight());
+        // push_layer(new RTLight());
+        push_layer(new VoxelRT());
     }
 
     ~GraphicsPlayground() {

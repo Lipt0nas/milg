@@ -1,0 +1,136 @@
+#version 460
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+#define WORKGROUP_SIZE 32
+#define NODE_SIZE 3
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE) in;
+
+layout(rgba8, set = 0, binding = 0) uniform image2D out_image;
+
+layout(push_constant) uniform PushConstants {
+    vec2 inverse_resolution;
+    vec2 resolution;
+    mat4 projection_matrix;
+    vec4 position;
+    uint32_t node_count;
+    uint32_t leaf_count;
+} push_constants;
+
+struct Node {
+    uint32_t packed_data[3];
+};
+
+layout(std140, binding = 1) readonly buffer SvoSSBOIn {
+    Node data[];
+} nodes;
+
+layout(std140, binding = 2) readonly buffer SvoLeavesSSBOIn {
+    uint8_t data[];
+} leaves;
+
+void get_primary_ray(vec2 uv, out vec3 ray_pos, out vec3 ray_dir) {
+    uv = uv * 2.0 - 1.0;
+
+    vec4 far = inverse(push_constants.projection_matrix) * vec4(uv, 1.0, 1.0);
+
+    ray_dir = normalize(far.xyz / far.w);
+    ray_pos = vec3(push_constants.position);
+}
+
+vec2 intersect_aabb(vec3 origin, vec3 invDir, vec3 bbMin, vec3 bbMax) {
+    vec3 t0 = (bbMin - origin) * invDir;
+    vec3 t1 = (bbMax - origin) * invDir;
+
+    vec3 temp = t0;
+    t0 = min(temp, t1), t1 = max(temp, t1);
+
+    float tmin = max(max(t0.x, t0.y), t0.z);
+    float tmax = min(min(t1.x, t1.y), t1.z);
+
+    return vec2(tmin, tmax);
+}
+
+// vec3 floor_scale(vec3 pos, int scale_exp) {
+//     uint mask = ~0u << scale_exp;
+//
+//     ivec3 iv = ivec3(floatBitsToInt(pos.x) & mask, floatBitsToInt(pos.y) & mask, floatBitsToInt(pos.z) & mask);
+//
+//     return vec3(intBitsToFloat(iv.x), intBitsToFloat(iv.y), intBitsToFloat(iv.z));
+// }
+//
+uint get_node_cell_index(vec3 pos, int scale_exp) {
+    uvec3 cell_pos = uvec3(floatBitsToUint(pos.x) >> scale_exp & 3, floatBitsToUint(pos.y) >> scale_exp & 3, floatBitsToUint(pos.z) >> scale_exp & 3);
+
+    return cell_pos.x + cell_pos.z * 4 + cell_pos.y * 16;
+}
+//
+// vec3 mirrored_pos(vec3 pos, vec3 dir, bool range_check) {
+//     uvec3 iv = ivec3(floatBitsToUInt(pos.x) ^ 0x7FFFFF, floatBitsToUInt(pos.y) ^ 0x7FFFFF, floatBitsToUInt(pos.z) ^ 0x7FFFFF);
+//     vec3 mirrored = vec3(uintBitsToFloat(iv.x), uintBitsToFloat(iv.y), uintBitsToFloat(iv.z));
+// }
+
+struct HitData {
+    bool hit;
+    vec3 color;
+    vec3 normal;
+    vec3 pos;
+};
+
+HitData cast_ray(vec3 origin, vec3 dir) {
+    HitData hit;
+    hit.hit = false;
+
+    vec3 inv_dir = 1.0 / dir;
+    vec3 pos = origin;
+    float tmax = 0;
+
+    for (int i = 0; i < 256; i++) {
+        ivec3 v_pos = ivec3(floor(pos));
+
+        uint idx = v_pos.x + v_pos.z * 4 + v_pos.y * 16;
+        if (idx < push_constants.node_count) {
+            uint32_t data = nodes.data[idx].packed_data[2];
+            vec4 color = unpackSnorm4x8(data);
+
+            hit.hit = true;
+            hit.pos = pos;
+            hit.normal = vec3(0.0);
+            hit.color = vec3(color);
+
+            break;
+        }
+
+        // if is a hit
+
+        vec3 cell_min = v_pos;
+        vec3 cell_max = cell_min + 1.0;
+        vec2 time = intersect_aabb(origin, inv_dir, cell_min, cell_max);
+
+        tmax = time.y + 0.0001;
+        pos = origin + tmax * dir;
+    }
+
+    return hit;
+}
+
+void main() {
+    ivec2 sample_pos = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = vec2(sample_pos + vec2(0.5)) * push_constants.inverse_resolution;
+
+    vec3 out_color = vec3(0.0);
+
+    vec3 ray_pos = vec3(0.0);
+    vec3 ray_dir = vec3(0.0);
+    get_primary_ray(uv, ray_pos, ray_dir);
+
+    HitData hit = cast_ray(ray_pos, ray_dir);
+    if (hit.hit) {
+        out_color = hit.color;
+    }
+
+    imageStore(out_image, sample_pos, vec4(out_color, 1));
+}

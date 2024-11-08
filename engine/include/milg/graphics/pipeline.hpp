@@ -1,5 +1,6 @@
 #pragma once
 
+#include <milg/graphics/buffer.hpp>
 #include <milg/graphics/texture.hpp>
 #include <milg/graphics/vk_context.hpp>
 
@@ -36,6 +37,9 @@ namespace milg::graphics {
         void bind_texture(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
                           uint32_t binding, const std::shared_ptr<Texture> &texture);
 
+        void bind_buffer(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
+                         uint32_t binding, const std::shared_ptr<Buffer> &buffer);
+
         void begin(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
                    uint32_t push_constant_size = 0, const void *push_constant_data = nullptr);
         void end(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer);
@@ -52,7 +56,8 @@ namespace milg::graphics {
 
         Pipeline *create_compute_pipeline(const std::string &name, const std::string &shader_id,
                                           const std::initializer_list<PipelineOutputDescription> &output_descriptions,
-                                          uint32_t texture_input_count, uint32_t push_constant_size = 0);
+                                          uint32_t texture_input_count, uint32_t buffer_input_count,
+                                          uint32_t push_constant_size = 0);
         void      begin_frame(VkCommandBuffer command_buffer);
         void      end_frame(VkCommandBuffer command_buffer);
 
