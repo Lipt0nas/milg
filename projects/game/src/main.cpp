@@ -47,7 +47,7 @@ public:
 
         // Capacity here is the maximum amount of sprites that can be drawn in one frame, more number
         // allocates more memory, but it's not that much to begin with
-        this->sprite_batch = SpriteBatch::create(context, framebuffer->format(), 10000);
+        this->sprite_batch = SpriteBatch::create(context, framebuffer->format(), VK_FORMAT_UNDEFINED, 10000);
     }
 
     void on_update(float delta) override {
@@ -84,7 +84,7 @@ public:
         for (cursor.y = 0; cursor.y < framebuffer->height(); cursor.y += tile_size.y) {
             for (cursor.x = 0; cursor.x < framebuffer->width(); cursor.x += tile_size.x) {
                 for (auto &tile : this->map->get_tiles(cursor)) {
-                    sprite_batch->draw_sprite(tile->sprite, tile->tileset->get_texture());
+                    sprite_batch->draw_sprite(tile->sprite, tile->tileset->get_texture(), nullptr);
                 }
             }
         }

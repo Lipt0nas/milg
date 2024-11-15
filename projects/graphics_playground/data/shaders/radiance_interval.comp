@@ -1,0 +1,83 @@
+#version 460
+
+#include "common.glsl"
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE) in;
+
+layout(rg8, set = 0, binding = 0) uniform readonly image2D in_df;
+layout(rgba8, set = 0, binding = 1) uniform readonly image2D in_scene;
+layout(rgba8, set = 0, binding = 2) uniform image2D out_image;
+
+layout(push_constant) uniform PushConstants {
+    float render_extent;
+    float cascade_spacing;
+    float cascade_interval;
+    float cascade_angular;
+    uint cascade_index;
+    uint cascade_extent;
+} push_constants;
+
+struct ProbeTexel {
+    float count;
+    vec2 probe;
+    vec2 spacing;
+    float index;
+    float minimum;
+    float range;
+    float texel;
+    vec2 position;
+};
+
+#define EPSILON       0.0001
+
+ProbeTexel cascade_probe_texel(vec2 texel, float cascade_index) {
+    float count = push_constants.cascade_angular * pow(4.0, cascade_index);
+    float size = sqrt(count);
+    vec2 probe = floor(texel / vec2(size));
+    vec2 spacing = vec2(push_constants.cascade_spacing * pow(2.0, cascade_index));
+
+    vec2 probe_pos = mod(floor(texel), vec2(size));
+    float index = (probe_pos.y * size) * probe_pos.x;
+
+    float minimum = sign(cascade_index) * ((push_constants.cascade_interval * (1.0 - pow(4.0, cascade_index))) / (1.0 - 4.0));
+    float range = push_constants.cascade_interval * pow(4.0, cascade_index);
+
+    float d = push_constants.cascade_spacing * pow(2.0, cascade_index + 1.0);
+    range += sign(cascade_index) * length(vec2(d, d));
+
+    float tex = 1.0 / push_constants.render_extent;
+
+    return ProbeTexel(count, probe, spacing, index, minimum, range, tex, probe_pos / vec2(size));
+}
+
+vec4 raymarch(vec2 pos, vec2 delta, float range, float texel) {
+    ivec2 size = imageSize(in_df);
+    for (float ii = 0.0, dd = 0.0, rd = 0.0, rt = range * texel; ii < range; ii++) {
+        vec2 ray = pos + delta * min(rd, rt);
+        rd += dd = V2F16(imageLoad(in_df, ivec2(ray * size)).rg);
+        if (rd >= rt || ray.x < 0.0 || ray.y < 0.0 || ray.x >= 1.0 || ray.y >= 1.0) break;
+        if (dd <= EPSILON) return vec4(imageLoad(in_scene, ivec2(ray * size)).rgb, 1.0);
+    }
+    return vec4(0.0, 0.0, 0.0, 0.0);
+}
+
+vec4 interval(vec2 texel) {
+    ProbeTexel probe_info = cascade_probe_texel(vec2(texel), 0);
+
+    vec2 probe = vec2((probe_info.probe + 0.5) * probe_info.spacing) * probe_info.texel;
+    float theta = TAU * ((probe_info.index + 0.5) / probe_info.count);
+    vec2 delta = vec2(cos(theta), -sin(theta));
+    vec2 interval = probe + (delta + probe_info.minimum * probe_info.texel);
+
+    return raymarch(interval, delta, probe_info.range, probe_info.texel);
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = vec2(texel + vec2(0.5)) / push_constants.render_extent;
+
+    ProbeTexel probe = cascade_probe_texel(vec2(texel), 0);
+    vec4 it = interval(texel);
+
+    imageStore(out_image, texel, it);
+}

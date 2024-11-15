@@ -17,11 +17,13 @@ namespace milg::graphics {
         constexpr static uint32_t TEXTURE_DESCRIPTOR_BINDING_COUNT = 1024;
 
         static std::shared_ptr<SpriteBatch> create(const std::shared_ptr<VulkanContext> &context,
-                                                   VkFormat albdedo_render_format, uint32_t capacity);
+                                                   VkFormat albdedo_render_format, VkFormat emissive_render_format,
+                                                   uint32_t capacity);
 
         ~SpriteBatch();
 
-        void draw_sprite(Sprite &sprite, const std::shared_ptr<Texture> &texture);
+        void draw_sprite(Sprite &sprite, const std::shared_ptr<Texture> &texture,
+                         const std::shared_ptr<Texture> &emissive_texture);
         void reset();
         void begin_batch(const glm::mat4 &matrix);
         void build_batches(VkCommandBuffer command_buffer);

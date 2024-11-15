@@ -9,6 +9,7 @@ set(SHADER_SOURCES
     "shaders/noise_seed.comp"
     "shaders/rt_upscale.comp"
     "shaders/svo_rt.comp"
+    "shaders/radiance_interval.comp"
 )
 
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/shaders")

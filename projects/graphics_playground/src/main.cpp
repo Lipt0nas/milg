@@ -52,19 +52,55 @@ public:
     std::shared_ptr<Texture>     light_texture    = nullptr;
     std::shared_ptr<SpriteBatch> sprite_batch     = nullptr;
 
-    uint64_t                         frame_index             = 0;
-    float                            rt_scale                = 0.5f;
-    std::shared_ptr<PipelineFactory> pipeline_factory        = nullptr;
-    Pipeline                        *voronoi_seed_pipeline   = nullptr;
-    Pipeline                        *voronoi_pipeline        = nullptr;
-    Pipeline                        *distance_field_pipeline = nullptr;
-    Pipeline                        *noise_seed_pipeline     = nullptr;
-    Pipeline                        *raytrace_pipeline       = nullptr;
-    Pipeline                        *rt_upscale_pipeline     = nullptr;
-    Pipeline                        *composite_pipeline      = nullptr;
+    uint64_t                         frame_index                = 0;
+    float                            rt_scale                   = 0.5f;
+    std::shared_ptr<PipelineFactory> pipeline_factory           = nullptr;
+    Pipeline                        *voronoi_seed_pipeline      = nullptr;
+    Pipeline                        *voronoi_pipeline           = nullptr;
+    Pipeline                        *distance_field_pipeline    = nullptr;
+    Pipeline                        *noise_seed_pipeline        = nullptr;
+    Pipeline                        *raytrace_pipeline          = nullptr;
+    Pipeline                        *rt_upscale_pipeline        = nullptr;
+    Pipeline                        *composite_pipeline         = nullptr;
+    Pipeline                        *radiance_interval_pipeline = nullptr;
 
     glm::vec2 mouse_position = {0.0f, 0.0f};
     float     time           = 0.0f;
+
+    uint32_t cascade_count = 0;
+    uint32_t render_extent = 1024;
+    float    angular       = 4.0f;
+    float    interval      = 4.0f;
+    float    spacing       = 4.0f;
+
+    struct {
+        float    render_extent    = 0.0f;
+        float    cascade_spacing  = 0.0f;
+        float    cascade_interval = 0.0f;
+        float    cascade_angular  = 0.0f;
+        uint32_t cascade_index    = 0;
+        uint32_t cascade_extent   = 0;
+    } rc_push_constants;
+
+    void update_cascade_constants() {
+        auto &window = Application::get().window();
+
+        rc_push_constants.render_extent    = render_extent;
+        rc_push_constants.cascade_angular  = glm::pow(4.0f, glm::ceil(glm::log2(angular) / glm::log2(4.0f)));
+        rc_push_constants.cascade_interval = (int(interval + (2 - 1)) & ~(2 - 1));
+        rc_push_constants.cascade_spacing  = glm::pow(2.0f, glm::ceil(glm::log2(spacing)));
+
+        rc_push_constants.cascade_extent =
+            glm::floor(rc_push_constants.render_extent / rc_push_constants.cascade_spacing) *
+            glm::sqrt(rc_push_constants.cascade_angular);
+
+        cascade_count = glm::ceil(
+            glm::log2((float)rc_push_constants.cascade_extent / glm::sqrt(rc_push_constants.cascade_angular)));
+
+        float diagonal = glm::distance(glm::vec2(0.0f), glm::vec2(1024.0f));
+        cascade_count =
+            (int)glm::min(glm::floor(glm::log2(4.0f * diagonal) / glm::log2(2.0f)) - 1, (float)cascade_count);
+    }
 
     void on_attach() override {
         MILG_INFO("Initializing Grapchiks");
@@ -147,6 +183,17 @@ public:
             {PipelineOutputDescription{
                 .format = VK_FORMAT_R8G8B8A8_UNORM, .width = window->width(), .height = window->height()}},
             4, 0, sizeof(composite_pass_constants));
+
+        update_cascade_constants();
+        auto cascade_descriptions = std::vector<PipelineOutputDescription>();
+        for (int i = 0; i < cascade_count; i++) {
+            cascade_descriptions.push_back(PipelineOutputDescription{
+                .format = VK_FORMAT_R8G8B8A8_UNORM, .width = render_extent, .height = render_extent});
+        }
+        MILG_INFO("cascade count {}", cascade_count);
+        this->radiance_interval_pipeline =
+            this->pipeline_factory->create_compute_pipeline("radiance_interval", "shaders/radiance_interval.comp.spv",
+                                                            cascade_descriptions, 3, 0, sizeof(rc_push_constants));
     }
 
     void on_update(float delta) override {
@@ -320,121 +367,18 @@ public:
         }
 
         {
-            auto pipeline = noise_seed_pipeline;
-            auto output   = pipeline->output_buffers[0];
+            auto pipeline      = radiance_interval_pipeline;
+            auto df_attachment = distance_field_pipeline->output_buffers[0];
+            auto output        = pipeline->output_buffers[0];
 
-            pipeline->begin(context, command_buffer);
+            pipeline->begin(context, command_buffer, sizeof(rc_push_constants), &rc_push_constants);
             output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            noise_texture->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-
-            pipeline->bind_texture(context, command_buffer, 0, noise_texture);
-            pipeline->bind_texture(context, command_buffer, 1, output);
-
-            struct {
-                float time;
-            } push_constants = {
-                .time = time,
-            };
-
-            pipeline->set_push_constants(context, command_buffer, sizeof(push_constants), &push_constants);
-            context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
-                                                  dispatch_size(output->height()), 1);
-            pipeline->end(context, command_buffer);
-        }
-
-        {
-            auto pipeline       = raytrace_pipeline;
-            auto output         = pipeline->output_buffers[0];
-            auto history_output = pipeline->output_buffers[1];
-            auto df_pass_buffer = distance_field_pipeline->output_buffers[0];
-            auto noise          = noise_seed_pipeline->output_buffers[0];
-
-            pipeline->begin(context, command_buffer, sizeof(raytrace_pass_constants), &raytrace_pass_constants);
-            df_pass_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            emissive_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            noise->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            history_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+            df_attachment->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
             albedo_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
 
-            if (frame_index == 0) {
-                const VkClearColorValue       clear_color       = {{0.0f, 0.0f, 0.0f, 1.0f}};
-                const VkImageSubresourceRange subresource_range = {
-                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel   = 0,
-                    .levelCount     = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount     = 1,
-                };
-                context->device_table().vkCmdClearColorImage(command_buffer, history_output->handle(),
-                                                             VK_IMAGE_LAYOUT_GENERAL, &clear_color, 1,
-                                                             &subresource_range);
-            } else {
-                if (frame_index % 2 == 0) {
-                    history_output = raytrace_pipeline->output_buffers[0];
-                    output         = raytrace_pipeline->output_buffers[1];
-                } else {
-                    history_output = raytrace_pipeline->output_buffers[1];
-                    output         = raytrace_pipeline->output_buffers[0];
-                }
-            };
-
-            pipeline->bind_texture(context, command_buffer, 0, df_pass_buffer);
-            pipeline->bind_texture(context, command_buffer, 1, emissive_buffer);
-            pipeline->bind_texture(context, command_buffer, 2, albedo_buffer);
-            pipeline->bind_texture(context, command_buffer, 3, noise);
-            pipeline->bind_texture(context, command_buffer, 4, history_output);
-            pipeline->bind_texture(context, command_buffer, 5, output);
-
-            raytrace_pass_constants.inverse_resolution = {1.0f / output->width(), 1.0f / output->height()};
-            raytrace_pass_constants.resolution         = {output->width(), output->height()};
-            raytrace_pass_constants.time               = time;
-            raytrace_pass_constants.scale_modifier     = rt_scale;
-
-            context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
-                                                  dispatch_size(output->height()), 1);
-            pipeline->end(context, command_buffer);
-        }
-
-        {
-            auto pipeline        = rt_upscale_pipeline;
-            auto rt_output       = raytrace_pipeline->output_buffers[0];
-            auto denoised_output = pipeline->output_buffers[0];
-            auto upscaled_output = pipeline->output_buffers[1];
-
-            pipeline->begin(context, command_buffer);
-            denoised_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            rt_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-
-            pipeline->bind_texture(context, command_buffer, 0, rt_output);
-            pipeline->bind_texture(context, command_buffer, 1, denoised_output);
-
-            pipeline->set_push_constants(context, command_buffer, sizeof(rt_upscale_pass_constants),
-                                         &rt_upscale_pass_constants);
-            context->device_table().vkCmdDispatch(command_buffer, dispatch_size(denoised_output->width()),
-                                                  dispatch_size(denoised_output->height()), 1);
-            pipeline->end(context, command_buffer);
-
-            denoised_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            upscaled_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            upscaled_output->blit_from(denoised_output, command_buffer);
-        }
-
-        {
-            auto pipeline  = composite_pipeline;
-            auto rt_output = rt_upscale_pipeline->output_buffers[1];
-            auto output    = pipeline->output_buffers[0];
-
-            pipeline->begin(context, command_buffer, sizeof(composite_pass_constants), &composite_pass_constants);
-            output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            albedo_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            rt_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-            emissive_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-
-            pipeline->bind_texture(context, command_buffer, 0, albedo_buffer);
-            pipeline->bind_texture(context, command_buffer, 1, emissive_buffer);
-            pipeline->bind_texture(context, command_buffer, 2, rt_output);
-            pipeline->bind_texture(context, command_buffer, 3, output);
+            pipeline->bind_texture(context, command_buffer, 0, df_attachment);
+            pipeline->bind_texture(context, command_buffer, 1, albedo_buffer);
+            pipeline->bind_texture(context, command_buffer, 2, output);
 
             context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
                                                   dispatch_size(output->height()), 1);
@@ -445,12 +389,160 @@ public:
                 command_buffer, output->handle(), {.width = output->width(), .height = output->height()});
         }
 
+        // {
+        //     auto pipeline = noise_seed_pipeline;
+        //     auto output   = pipeline->output_buffers[0];
+        //
+        //     pipeline->begin(context, command_buffer);
+        //     output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     noise_texture->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //
+        //     pipeline->bind_texture(context, command_buffer, 0, noise_texture);
+        //     pipeline->bind_texture(context, command_buffer, 1, output);
+        //
+        //     struct {
+        //         float time;
+        //     } push_constants = {
+        //         .time = time,
+        //     };
+        //
+        //     pipeline->set_push_constants(context, command_buffer, sizeof(push_constants), &push_constants);
+        //     context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
+        //                                           dispatch_size(output->height()), 1);
+        //     pipeline->end(context, command_buffer);
+        // }
+        //
+        // {
+        //     auto pipeline       = raytrace_pipeline;
+        //     auto output         = pipeline->output_buffers[0];
+        //     auto history_output = pipeline->output_buffers[1];
+        //     auto df_pass_buffer = distance_field_pipeline->output_buffers[0];
+        //     auto noise          = noise_seed_pipeline->output_buffers[0];
+        //
+        //     pipeline->begin(context, command_buffer, sizeof(raytrace_pass_constants), &raytrace_pass_constants);
+        //     df_pass_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     emissive_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     noise->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     history_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     albedo_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //
+        //     if (frame_index == 0) {
+        //         const VkClearColorValue       clear_color       = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        //         const VkImageSubresourceRange subresource_range = {
+        //             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+        //             .baseMipLevel   = 0,
+        //             .levelCount     = 1,
+        //             .baseArrayLayer = 0,
+        //             .layerCount     = 1,
+        //         };
+        //         context->device_table().vkCmdClearColorImage(command_buffer, history_output->handle(),
+        //                                                      VK_IMAGE_LAYOUT_GENERAL, &clear_color, 1,
+        //                                                      &subresource_range);
+        //     } else {
+        //         if (frame_index % 2 == 0) {
+        //             history_output = raytrace_pipeline->output_buffers[0];
+        //             output         = raytrace_pipeline->output_buffers[1];
+        //         } else {
+        //             history_output = raytrace_pipeline->output_buffers[1];
+        //             output         = raytrace_pipeline->output_buffers[0];
+        //         }
+        //     };
+        //
+        //     pipeline->bind_texture(context, command_buffer, 0, df_pass_buffer);
+        //     pipeline->bind_texture(context, command_buffer, 1, emissive_buffer);
+        //     pipeline->bind_texture(context, command_buffer, 2, albedo_buffer);
+        //     pipeline->bind_texture(context, command_buffer, 3, noise);
+        //     pipeline->bind_texture(context, command_buffer, 4, history_output);
+        //     pipeline->bind_texture(context, command_buffer, 5, output);
+        //
+        //     raytrace_pass_constants.inverse_resolution = {1.0f / output->width(), 1.0f / output->height()};
+        //     raytrace_pass_constants.resolution         = {output->width(), output->height()};
+        //     raytrace_pass_constants.time               = time;
+        //     raytrace_pass_constants.scale_modifier     = rt_scale;
+        //
+        //     context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
+        //                                           dispatch_size(output->height()), 1);
+        //     pipeline->end(context, command_buffer);
+        // }
+        //
+        // {
+        //     auto pipeline        = rt_upscale_pipeline;
+        //     auto rt_output       = raytrace_pipeline->output_buffers[0];
+        //     auto denoised_output = pipeline->output_buffers[0];
+        //     auto upscaled_output = pipeline->output_buffers[1];
+        //
+        //     pipeline->begin(context, command_buffer);
+        //     denoised_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     rt_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //
+        //     pipeline->bind_texture(context, command_buffer, 0, rt_output);
+        //     pipeline->bind_texture(context, command_buffer, 1, denoised_output);
+        //
+        //     pipeline->set_push_constants(context, command_buffer, sizeof(rt_upscale_pass_constants),
+        //                                  &rt_upscale_pass_constants);
+        //     context->device_table().vkCmdDispatch(command_buffer, dispatch_size(denoised_output->width()),
+        //                                           dispatch_size(denoised_output->height()), 1);
+        //     pipeline->end(context, command_buffer);
+        //
+        //     denoised_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        //     upscaled_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        //     upscaled_output->blit_from(denoised_output, command_buffer);
+        // }
+        //
+        // {
+        //     auto pipeline  = composite_pipeline;
+        //     auto rt_output = rt_upscale_pipeline->output_buffers[1];
+        //     auto output    = pipeline->output_buffers[0];
+        //
+        //     pipeline->begin(context, command_buffer, sizeof(composite_pass_constants), &composite_pass_constants);
+        //     output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     albedo_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     rt_output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //     emissive_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+        //
+        //     pipeline->bind_texture(context, command_buffer, 0, albedo_buffer);
+        //     pipeline->bind_texture(context, command_buffer, 1, emissive_buffer);
+        //     pipeline->bind_texture(context, command_buffer, 2, rt_output);
+        //     pipeline->bind_texture(context, command_buffer, 3, output);
+        //
+        //     context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
+        //                                           dispatch_size(output->height()), 1);
+        //     pipeline->end(context, command_buffer);
+        //
+        //     output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        //     Application::get().swapchain()->blit_to_current_image(
+        //         command_buffer, output->handle(), {.width = output->width(), .height = output->height()});
+        // }
+
         pipeline_factory->end_frame(command_buffer);
         context->device_table().vkEndCommandBuffer(command_buffer);
 
         ImGui::Begin("Graphics");
         if (ImGui::BeginTabBar("##graphics_tab_bar")) {
             if (ImGui::BeginTabItem("Graphics")) {
+                ImGui::SeparatorText("Cascade Info");
+                ImGui::Text("Render extent %d", render_extent);
+
+                if (ImGui::SliderFloat("Angular", &angular, 2.0, 16.0)) {
+                    update_cascade_constants();
+                }
+
+                if (ImGui::SliderFloat("Interval", &interval, 2.0, 16.0)) {
+                    update_cascade_constants();
+                }
+
+                if (ImGui::SliderFloat("Spacing", &spacing, 2.0, 16.0)) {
+                    update_cascade_constants();
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Cascade count %d", cascade_count);
+                ImGui::Text("Cascade extent %d", rc_push_constants.cascade_extent);
+                ImGui::Text("Cascade spacing %f", rc_push_constants.cascade_spacing);
+                ImGui::Text("Cascade interval %f", rc_push_constants.cascade_interval);
+                ImGui::Text("Cascade angular %f", rc_push_constants.cascade_angular);
+
                 ImGui::SeparatorText("Performance");
                 ImGui::Text("Delta time: %.3f ms", delta);
                 ImGui::Text("FPS: %d", Application::get().frames_per_second());
@@ -469,20 +561,20 @@ public:
                     ImGui::Separator();
                     ImGui::Text("Total: %.3f ms", total_time);
                 }
-
-                ImGui::SeparatorText("RT Options");
-                ImGui::SliderFloat("Bounce Factor", &raytrace_pass_constants.bounce_factor, 0.0f, 1.0f);
-                ImGui::SliderFloat("Blend Factor", &raytrace_pass_constants.blend_factor, 0.01f, 0.99f);
-
-                ImGui::SeparatorText("Composite Options");
-                ImGui::SliderFloat("Exposure", &composite_pass_constants.exposure, 0.0f, 10.0f);
-
-                ImGui::SeparatorText("Denoise Options");
-                ImGui::SliderFloat("Sample Count", &rt_upscale_pass_constants.sample_num, 1.0f, 120.0f);
-                ImGui::SliderFloat("Distribution Bias", &rt_upscale_pass_constants.distribution_bias, 0.0f, 1.0f);
-                ImGui::SliderFloat("Pixel Multiplier", &rt_upscale_pass_constants.pixel_multiplier, 1.0f, 3.0f);
-                ImGui::SliderFloat("Iverse Hue Tolerance", &rt_upscale_pass_constants.inverse_hue_tolerance, 2.0f,
-                                   30.0f);
+                //
+                // ImGui::SeparatorText("RT Options");
+                // ImGui::SliderFloat("Bounce Factor", &raytrace_pass_constants.bounce_factor, 0.0f, 1.0f);
+                // ImGui::SliderFloat("Blend Factor", &raytrace_pass_constants.blend_factor, 0.01f, 0.99f);
+                //
+                // ImGui::SeparatorText("Composite Options");
+                // ImGui::SliderFloat("Exposure", &composite_pass_constants.exposure, 0.0f, 10.0f);
+                //
+                // ImGui::SeparatorText("Denoise Options");
+                // ImGui::SliderFloat("Sample Count", &rt_upscale_pass_constants.sample_num, 1.0f, 120.0f);
+                // ImGui::SliderFloat("Distribution Bias", &rt_upscale_pass_constants.distribution_bias, 0.0f, 1.0f);
+                // ImGui::SliderFloat("Pixel Multiplier", &rt_upscale_pass_constants.pixel_multiplier, 1.0f, 3.0f);
+                // ImGui::SliderFloat("Iverse Hue Tolerance", &rt_upscale_pass_constants.inverse_hue_tolerance, 2.0f,
+                //                    30.0f);
 
                 ImGui::EndTabItem();
             }
@@ -520,206 +612,6 @@ public:
     }
 };
 
-#pragma pack(1)
-struct SvoNode {
-    uint8_t  is_leaf : 1;
-    uint32_t child_ptr : 31;
-    uint64_t child_mask;
-};
-
-uint64_t pack_bits_64(const uint8_t data[64]) {
-    uint64_t mask = 0;
-    for (uint32_t i = 0; i < 64; i++) {
-        uint64_t bit = data[i] != 0;
-        mask |= bit << i;
-    }
-
-    return mask;
-}
-
-void left_pack(uint8_t data[64], uint64_t mask) {
-    for (uint32_t i = 0, j = 0; mask != 0; i++) {
-        data[j] = data[i];
-        j += (mask & 1);
-        mask >>= 1;
-    }
-}
-
-SvoNode generate_svo_tree(std::vector<SvoNode> &nodes, std::vector<uint8_t> &leaf_data, int32_t scale,
-                          glm::ivec3 position) {
-    SvoNode node = {};
-
-    if (scale == 2) {
-        alignas(64) uint8_t temp[64];
-
-        for (int32_t i = 0; i < 64; i++) {
-            temp[i] = glm::linearRand(0, 1);
-        }
-        node.is_leaf    = 1;
-        node.child_mask = pack_bits_64(temp);
-
-        left_pack(temp, node.child_mask);
-        node.child_ptr = leaf_data.size();
-        leaf_data.insert(leaf_data.end(), temp, temp + std::popcount(node.child_mask));
-
-        return node;
-    }
-
-    scale -= 2;
-
-    std::vector<SvoNode> children;
-
-    for (int32_t i = 0; i < 64; i++) {
-        glm::ivec3 child_pos = i >> glm::ivec3(0, 4, 2) & 3;
-        SvoNode    child     = generate_svo_tree(nodes, leaf_data, scale, position + (child_pos << scale));
-
-        if (child.child_mask != 0) {
-            node.child_mask |= 1ull << i;
-            children.push_back(child);
-        }
-    }
-
-    node.child_ptr = nodes.size();
-    nodes.insert(nodes.end(), children.begin(), children.end());
-
-    return node;
-}
-
-class VoxelRT : public Layer {
-public:
-    struct {
-        glm::vec2 inverse_resolution = {0.0f, 0.0f};
-        glm::vec2 resolution         = {0.0f, 0.0f};
-        glm::mat4 projection         = glm::mat4(1.0f);
-        glm::vec4 position           = {0.0f, 0.0f, 0.0f, 0.0f};
-        uint32_t  node_count         = 0;
-        uint32_t  leaf_count         = 0;
-    } svo_rt_constants;
-
-    std::shared_ptr<VulkanContext> context = nullptr;
-
-    std::shared_ptr<PipelineFactory> pipeline_factory      = nullptr;
-    Pipeline                        *svo_raytrace_pipeline = nullptr;
-
-    std::shared_ptr<Buffer> svo_data      = nullptr;
-    std::shared_ptr<Buffer> svo_leaf_data = nullptr;
-
-    void on_attach() override {
-        srand(time(0));
-
-        auto &window = Application::get().window();
-        context      = Application::get().context();
-
-        pipeline_factory = PipelineFactory::create(context);
-
-        std::vector<uint8_t> leaf_data;
-        std::vector<SvoNode> nodes;
-        nodes.resize(1);
-
-        generate_svo_tree(nodes, leaf_data, 6, glm::ivec3(0, 0, 0));
-
-        MILG_INFO("leaf_data: {}\nnodes: {}", leaf_data.size(), nodes.size());
-
-        svo_rt_constants.leaf_count = leaf_data.size();
-        svo_rt_constants.node_count = nodes.size();
-        {
-            svo_data =
-                Buffer::create(context, BufferCreateInfo{
-                                            .size             = sizeof(SvoNode) * nodes.size(),
-                                            .memory_usage     = VMA_MEMORY_USAGE_AUTO,
-                                            .allocation_flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                                                                VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                                            .usage_flags = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                        });
-
-            uint8_t *data   = reinterpret_cast<uint8_t *>(svo_data->allocation_info().pMappedData);
-            size_t   offset = sizeof(SvoNode) * nodes.size();
-            mempcpy(data, nodes.data(), offset);
-        }
-
-        {
-            svo_leaf_data =
-                Buffer::create(context, BufferCreateInfo{
-                                            .size             = sizeof(uint8_t) * leaf_data.size(),
-                                            .memory_usage     = VMA_MEMORY_USAGE_AUTO,
-                                            .allocation_flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                                                                VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                                            .usage_flags = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                        });
-
-            uint8_t *data   = reinterpret_cast<uint8_t *>(svo_leaf_data->allocation_info().pMappedData);
-            size_t   offset = sizeof(uint8_t) * leaf_data.size();
-            mempcpy(data, leaf_data.data(), offset);
-        }
-
-        svo_raytrace_pipeline = pipeline_factory->create_compute_pipeline(
-            "SVO RT", "shaders/svo_rt.comp.spv",
-            {PipelineOutputDescription{
-                .format = VK_FORMAT_R8G8B8A8_UNORM, .width = window->width(), .height = window->height()}},
-            1, 2, sizeof(svo_rt_constants));
-    }
-
-    void on_update(float delta) override {
-        auto &window = Application::get().window();
-
-        auto resolution         = glm::vec2(window->width(), window->height());
-        auto inverse_resolution = glm::vec2(1.0f) / resolution;
-
-        auto command_buffer = Application::get().acquire_command_buffer();
-
-        const VkCommandBufferBeginInfo command_buffer_begin_info = {
-            .sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .pNext            = nullptr,
-            .flags            = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            .pInheritanceInfo = nullptr,
-        };
-
-        context->device_table().vkBeginCommandBuffer(command_buffer, &command_buffer_begin_info);
-        pipeline_factory->begin_frame(command_buffer);
-
-        {
-            auto pipeline = svo_raytrace_pipeline;
-            auto output   = pipeline->output_buffers[0];
-
-            pipeline->begin(context, command_buffer);
-            output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
-
-            pipeline->bind_texture(context, command_buffer, 0, output);
-            pipeline->bind_buffer(context, command_buffer, 1, svo_data);
-            pipeline->bind_buffer(context, command_buffer, 2, svo_leaf_data);
-
-            auto projection_mat = glm::perspective(90.0f, resolution.x / resolution.y, 0.1f, 100.0f);
-            auto cam_pos        = glm::vec3(0.0, 0.0, 0.0);
-
-            svo_rt_constants.resolution         = resolution;
-            svo_rt_constants.inverse_resolution = inverse_resolution;
-            svo_rt_constants.projection         = projection_mat;
-
-            pipeline->set_push_constants(context, command_buffer, sizeof(svo_rt_constants), &svo_rt_constants);
-            context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
-                                                  dispatch_size(output->height()), 1);
-            pipeline->end(context, command_buffer);
-
-            output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            Application::get().swapchain()->blit_to_current_image(
-                command_buffer, output->handle(), {.width = output->width(), .height = output->height()});
-        }
-
-        pipeline_factory->end_frame(command_buffer);
-        context->device_table().vkEndCommandBuffer(command_buffer);
-
-        ImGui::Begin("Debug");
-        { ImGui::DragFloat4("Position", &svo_rt_constants.position.x); }
-        ImGui::End();
-    }
-
-    void on_detach() override {
-    }
-
-    void on_event(Event &e) override {
-    }
-};
-
 class GraphicsPlayground : public Application {
 public:
     GraphicsPlayground(int argc, char **argv, const WindowCreateInfo &window_info)
@@ -729,8 +621,7 @@ public:
         AssetStore::add_search_path((bindir / "data").lexically_normal());
         AssetStore::add_search_path(ASSET_DIR);
 
-        // push_layer(new RTLight());
-        push_layer(new VoxelRT());
+        push_layer(new RTLight());
     }
 
     ~GraphicsPlayground() {

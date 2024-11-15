@@ -102,10 +102,11 @@ namespace milg::graphics {
         m_pipelines.clear();
     }
 
-    Pipeline *PipelineFactory::create_compute_pipeline(
-        const std::string &name, const std::string &shader_id,
-        const std::initializer_list<PipelineOutputDescription> &output_descriptions, uint32_t texture_input_count,
-        uint32_t buffer_input_count, uint32_t push_constant_size) {
+    Pipeline *
+    PipelineFactory::create_compute_pipeline(const std::string &name, const std::string &shader_id,
+                                             const std::vector<PipelineOutputDescription> &output_descriptions,
+                                             uint32_t texture_input_count, uint32_t buffer_input_count,
+                                             uint32_t push_constant_size) {
         if (m_pipelines.find(name) != m_pipelines.end()) {
             MILG_ERROR("Pipeline with name {} already exists", name);
             return nullptr;

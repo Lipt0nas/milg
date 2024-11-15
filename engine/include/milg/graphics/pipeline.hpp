@@ -55,7 +55,7 @@ namespace milg::graphics {
         ~PipelineFactory();
 
         Pipeline *create_compute_pipeline(const std::string &name, const std::string &shader_id,
-                                          const std::initializer_list<PipelineOutputDescription> &output_descriptions,
+                                          const std::vector<PipelineOutputDescription> &output_descriptions,
                                           uint32_t texture_input_count, uint32_t buffer_input_count,
                                           uint32_t push_constant_size = 0);
         void      begin_frame(VkCommandBuffer command_buffer);

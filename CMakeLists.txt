@@ -27,7 +27,6 @@ FetchContent_Declare(
   GIT_TAG 1.3.270
   GIT_SHALLOW TRUE
   GIT_PROGRESS TRUE
-  FIND_PACKAGE_ARGS 1.3.270 CONFIG
 )
 
 FetchContent_Declare(
