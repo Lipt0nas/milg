@@ -148,18 +148,6 @@ namespace milg::graphics {
         m_context->device_table().vkCreateDescriptorSetLayout(m_context->device(), &descriptor_set_layout_info, nullptr,
                                                               &descriptor_set_layout);
 
-        const VkDescriptorSetAllocateInfo descriptor_set_allocate_info = {
-            .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .pNext              = nullptr,
-            .descriptorPool     = m_global_descriptor_pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts        = &descriptor_set_layout,
-        };
-
-        VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-        m_context->device_table().vkAllocateDescriptorSets(m_context->device(), &descriptor_set_allocate_info,
-                                                           &descriptor_set);
-
         auto load_shader_module = [&](const std::string &shader_id) -> VkShaderModule {
             VkShaderModule shader_module = VK_NULL_HANDLE;
 
@@ -225,12 +213,13 @@ namespace milg::graphics {
                                                                     &pipeline_info, nullptr, &pipeline_handle));
 
         m_pipelines[name] = {
-            .pipeline    = pipeline_handle,
-            .layout      = pipeline_layout,
-            .set_layout  = descriptor_set_layout,
-            .set         = descriptor_set,
-            .query_pool  = m_query_pools[0],
-            .query_index = static_cast<uint32_t>(m_pipelines.size()) + 1,
+            .descriptor_pool = m_global_descriptor_pool,
+            .pipeline        = pipeline_handle,
+            .layout          = pipeline_layout,
+            .set_layout      = descriptor_set_layout,
+            .sets            = {},
+            .query_pool      = m_query_pools[0],
+            .query_index     = static_cast<uint32_t>(m_pipelines.size()) + 1,
         };
         for (const auto &output_description : output_descriptions) {
             m_pipelines[name].output_buffers.push_back(
@@ -243,6 +232,7 @@ namespace milg::graphics {
                                 output_description.width, output_description.height));
         }
         vkDestroyShaderModule(m_context->device(), shader_module, nullptr);
+        m_pipelines[name].allocate_new_set(m_context);
 
         return &m_pipelines[name];
     }
@@ -313,6 +303,8 @@ namespace milg::graphics {
 
     void Pipeline::bind_texture(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
                                 uint32_t binding, const std::shared_ptr<Texture> &texture) {
+        uint32_t set_index = dispatch_count;
+
         VkDescriptorImageInfo image_info = {
             .sampler     = VK_NULL_HANDLE,
             .imageView   = texture->image_view(),
@@ -322,7 +314,7 @@ namespace milg::graphics {
         VkWriteDescriptorSet write_descriptor_set = {
             .sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .pNext            = nullptr,
-            .dstSet           = set,
+            .dstSet           = sets[set_index],
             .dstBinding       = binding,
             .dstArrayElement  = 0,
             .descriptorCount  = 1,
@@ -336,12 +328,14 @@ namespace milg::graphics {
 
     void Pipeline::bind_buffer(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
                                uint32_t binding, const std::shared_ptr<Buffer> &buffer) {
+        uint32_t set_index = dispatch_count;
+
         VkDescriptorBufferInfo buffer_info = {.buffer = buffer->handle(), .offset = 0, .range = buffer->size()};
 
         VkWriteDescriptorSet write_descriptor_set = {
             .sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .pNext            = nullptr,
-            .dstSet           = set,
+            .dstSet           = sets[set_index],
             .dstBinding       = binding,
             .dstArrayElement  = 0,
             .descriptorCount  = 1,
@@ -355,28 +349,58 @@ namespace milg::graphics {
 
     void Pipeline::begin(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
                          uint32_t push_constant_size, const void *push_constant_data) {
+        dispatch_count = 0;
         if (query_pool != VK_NULL_HANDLE) {
             context->device_table().vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                                         query_pool, query_index);
         }
         context->device_table().vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         context->device_table().vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
-                                                        &set, 0, nullptr);
+                                                        &sets[0], 0, nullptr);
         if (push_constant_size > 0) {
             set_push_constants(context, command_buffer, push_constant_size, push_constant_data);
         }
     }
 
     void Pipeline::end(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer) {
-        // if (query_pool != VK_NULL_HANDLE) {
-        //     context->device_table().vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-        //     query_pool,
-        //                                                 pipeline_index * 2 + 1);
-        // }
     }
 
     void Pipeline::set_push_constants(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
                                       uint32_t size, const void *data) {
         context->device_table().vkCmdPushConstants(command_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data);
+    }
+
+    void Pipeline::dispatch(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
+                            uint32_t size_x, uint32_t size_y, uint32_t size_z) {
+        context->device_table().vkCmdDispatch(command_buffer, size_x, size_y, size_z);
+        dispatch_count++;
+    }
+
+    void Pipeline::rebind_descriptor_set(const std::shared_ptr<VulkanContext> &context,
+                                         VkCommandBuffer                       command_buffer) {
+        uint32_t set_index = dispatch_count;
+
+        if (set_index >= sets.size()) {
+            MILG_ERROR("Set {} was not allocated!", set_index);
+            return;
+        }
+
+        context->device_table().vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
+                                                        &sets[set_index], 0, nullptr);
+    }
+
+    void Pipeline::allocate_new_set(const std::shared_ptr<VulkanContext> &context) {
+        const VkDescriptorSetAllocateInfo descriptor_set_allocate_info = {
+            .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext              = nullptr,
+            .descriptorPool     = descriptor_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts        = &set_layout,
+        };
+
+        VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+        context->device_table().vkAllocateDescriptorSets(context->device(), &descriptor_set_allocate_info,
+                                                         &descriptor_set);
+        sets.push_back(descriptor_set);
     }
 } // namespace milg::graphics

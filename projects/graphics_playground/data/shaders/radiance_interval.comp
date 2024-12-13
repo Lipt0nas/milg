@@ -13,8 +13,8 @@ layout(push_constant) uniform PushConstants {
     float cascade_spacing;
     float cascade_interval;
     float cascade_angular;
-    uint cascade_index;
-    uint cascade_extent;
+    int cascade_index;
+    int cascade_extent;
 } push_constants;
 
 struct ProbeTexel {
@@ -28,7 +28,7 @@ struct ProbeTexel {
     vec2 position;
 };
 
-#define EPSILON       0.0001
+#define EPSILON       0.001
 
 ProbeTexel cascade_probe_texel(vec2 texel, float cascade_index) {
     float count = push_constants.cascade_angular * pow(4.0, cascade_index);
@@ -37,7 +37,7 @@ ProbeTexel cascade_probe_texel(vec2 texel, float cascade_index) {
     vec2 spacing = vec2(push_constants.cascade_spacing * pow(2.0, cascade_index));
 
     vec2 probe_pos = mod(floor(texel), vec2(size));
-    float index = (probe_pos.y * size) * probe_pos.x;
+    float index = (probe_pos.y * size) + probe_pos.x;
 
     float minimum = sign(cascade_index) * ((push_constants.cascade_interval * (1.0 - pow(4.0, cascade_index))) / (1.0 - 4.0));
     float range = push_constants.cascade_interval * pow(4.0, cascade_index);
@@ -62,12 +62,12 @@ vec4 raymarch(vec2 pos, vec2 delta, float range, float texel) {
 }
 
 vec4 interval(vec2 texel) {
-    ProbeTexel probe_info = cascade_probe_texel(vec2(texel), 0);
+    ProbeTexel probe_info = cascade_probe_texel(texel, push_constants.cascade_index);
 
     vec2 probe = vec2((probe_info.probe + 0.5) * probe_info.spacing) * probe_info.texel;
     float theta = TAU * ((probe_info.index + 0.5) / probe_info.count);
     vec2 delta = vec2(cos(theta), -sin(theta));
-    vec2 interval = probe + (delta + probe_info.minimum * probe_info.texel);
+    vec2 interval = probe + (delta * probe_info.minimum * probe_info.texel);
 
     return raymarch(interval, delta, probe_info.range, probe_info.texel);
 }
@@ -76,8 +76,6 @@ void main() {
     ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
     vec2 uv = vec2(texel + vec2(0.5)) / push_constants.render_extent;
 
-    ProbeTexel probe = cascade_probe_texel(vec2(texel), 0);
     vec4 it = interval(texel);
-
     imageStore(out_image, texel, it);
 }

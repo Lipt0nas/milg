@@ -1,0 +1,59 @@
+#version 460
+
+#include "common.glsl"
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE) in;
+
+layout(rgba8, set = 0, binding = 0) uniform readonly image2D in_radiance;
+layout(rgba8, set = 0, binding = 1) uniform readonly image2D in_albedo;
+layout(rgba8, set = 0, binding = 2) uniform image2D out_image;
+
+layout(push_constant) uniform PushConstants {
+    float render_extent;
+    float cascade_spacing;
+    float cascade_interval;
+    float cascade_angular;
+    int cascade_index;
+    int cascade_extent;
+} push_constants;
+
+struct ProbeTexel {
+    float count;
+    float size;
+    float probes;
+};
+
+ProbeTexel cascade_probe_texel(float cascade_index) {
+    float count = push_constants.cascade_angular * pow(4.0, cascade_index);
+    float size = sqrt(count);
+    float probes = push_constants.cascade_extent / size;
+
+    return ProbeTexel(count, size, probes);
+}
+
+vec4 cascade_fetch(ProbeTexel info, vec2 texel_index, float theta_index) {
+    ivec2 size = imageSize(in_radiance);
+    vec2 probeTexel = texel_index * info.size;
+    probeTexel += vec2(mod(theta_index, info.size), (theta_index / info.size));
+    vec2 cascadeTexelPosition = probeTexel / push_constants.cascade_extent;
+    return imageLoad(in_radiance, ivec2(cascadeTexelPosition * size));
+}
+
+void main() {
+    ivec2 size = imageSize(in_radiance);
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = vec2(texel + vec2(0.5)) / push_constants.render_extent;
+
+    ProbeTexel probeInfo = cascade_probe_texel(push_constants.cascade_index);
+    vec2 mipmapCoord = texel;
+
+    vec4 radiance = vec4(0.0, 0.0, 0.0, 0.0);
+    for (float i = 0.0; i < probeInfo.count; i++) {
+        radiance += cascade_fetch(probeInfo, mipmapCoord, i);
+    }
+
+    radiance.rgb /= probeInfo.count;
+    radiance.rgb *= 5;
+
+    imageStore(out_image, texel, vec4(radiance.rgb, 1.0));
+}

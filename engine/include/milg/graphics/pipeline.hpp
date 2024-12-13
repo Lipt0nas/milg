@@ -21,16 +21,19 @@ namespace milg::graphics {
     };
 
     struct Pipeline {
+        VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+
         VkPipeline       pipeline = VK_NULL_HANDLE;
         VkPipelineLayout layout   = VK_NULL_HANDLE;
 
-        VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
-        VkDescriptorSet       set        = VK_NULL_HANDLE;
+        VkDescriptorSetLayout        set_layout = VK_NULL_HANDLE;
+        std::vector<VkDescriptorSet> sets;
 
         VkQueryPool query_pool = VK_NULL_HANDLE;
 
         uint32_t query_index    = 0;
         float    execution_time = 0;
+        uint32_t dispatch_count = 0;
 
         std::vector<std::shared_ptr<Texture>> output_buffers;
 
@@ -46,6 +49,13 @@ namespace milg::graphics {
 
         void set_push_constants(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer,
                                 uint32_t size, const void *data);
+
+        void dispatch(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer, uint32_t size_x,
+                      uint32_t size_y, uint32_t size_z);
+
+        void rebind_descriptor_set(const std::shared_ptr<VulkanContext> &context, VkCommandBuffer command_buffer);
+
+        void allocate_new_set(const std::shared_ptr<VulkanContext> &context);
     };
 
     class PipelineFactory {

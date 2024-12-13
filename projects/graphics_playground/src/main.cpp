@@ -52,54 +52,62 @@ public:
     std::shared_ptr<Texture>     light_texture    = nullptr;
     std::shared_ptr<SpriteBatch> sprite_batch     = nullptr;
 
-    uint64_t                         frame_index                = 0;
-    float                            rt_scale                   = 0.5f;
-    std::shared_ptr<PipelineFactory> pipeline_factory           = nullptr;
-    Pipeline                        *voronoi_seed_pipeline      = nullptr;
-    Pipeline                        *voronoi_pipeline           = nullptr;
-    Pipeline                        *distance_field_pipeline    = nullptr;
-    Pipeline                        *noise_seed_pipeline        = nullptr;
-    Pipeline                        *raytrace_pipeline          = nullptr;
-    Pipeline                        *rt_upscale_pipeline        = nullptr;
-    Pipeline                        *composite_pipeline         = nullptr;
-    Pipeline                        *radiance_interval_pipeline = nullptr;
+    uint64_t                         frame_index                 = 0;
+    float                            rt_scale                    = 0.5f;
+    std::shared_ptr<PipelineFactory> pipeline_factory            = nullptr;
+    Pipeline                        *voronoi_seed_pipeline       = nullptr;
+    Pipeline                        *voronoi_pipeline            = nullptr;
+    Pipeline                        *distance_field_pipeline     = nullptr;
+    Pipeline                        *noise_seed_pipeline         = nullptr;
+    Pipeline                        *raytrace_pipeline           = nullptr;
+    Pipeline                        *rt_upscale_pipeline         = nullptr;
+    Pipeline                        *composite_pipeline          = nullptr;
+    Pipeline                        *radiance_interval_pipeline  = nullptr;
+    Pipeline                        *radiance_merge_pipeline     = nullptr;
+    Pipeline                        *radiance_composite_pipeline = nullptr;
 
     glm::vec2 mouse_position = {0.0f, 0.0f};
     float     time           = 0.0f;
 
-    uint32_t cascade_count = 0;
-    uint32_t render_extent = 1024;
-    float    angular       = 4.0f;
-    float    interval      = 4.0f;
-    float    spacing       = 4.0f;
+    int32_t cascade_count = 0;
+    int32_t render_extent = 1024;
+    float   angular       = 4.0f;
+    float   interval      = 4.0f;
+    float   spacing       = 2.0f;
 
     struct {
-        float    render_extent    = 0.0f;
-        float    cascade_spacing  = 0.0f;
-        float    cascade_interval = 0.0f;
-        float    cascade_angular  = 0.0f;
-        uint32_t cascade_index    = 0;
-        uint32_t cascade_extent   = 0;
+        float   render_extent    = 0.0f;
+        float   cascade_spacing  = 0.0f;
+        float   cascade_interval = 0.0f;
+        float   cascade_angular  = 0.0f;
+        int32_t cascade_index    = 0;
+        int32_t cascade_extent   = 0;
     } rc_push_constants;
+
+    float logn(float n, float val) {
+        return glm::log(val) / glm::log(n);
+    }
 
     void update_cascade_constants() {
         auto &window = Application::get().window();
 
         rc_push_constants.render_extent    = render_extent;
-        rc_push_constants.cascade_angular  = glm::pow(4.0f, glm::ceil(glm::log2(angular) / glm::log2(4.0f)));
+        rc_push_constants.cascade_angular  = glm::pow(4.0f, glm::ceil(logn(4.0f, angular)));
         rc_push_constants.cascade_interval = (int(interval + (2 - 1)) & ~(2 - 1));
-        rc_push_constants.cascade_spacing  = glm::pow(2.0f, glm::ceil(glm::log2(spacing)));
+        rc_push_constants.cascade_spacing  = glm::pow(2.0f, glm::ceil(logn(2.0f, spacing)));
 
         rc_push_constants.cascade_extent =
             glm::floor(rc_push_constants.render_extent / rc_push_constants.cascade_spacing) *
             glm::sqrt(rc_push_constants.cascade_angular);
 
-        cascade_count = glm::ceil(
-            glm::log2((float)rc_push_constants.cascade_extent / glm::sqrt(rc_push_constants.cascade_angular)));
-
-        float diagonal = glm::distance(glm::vec2(0.0f), glm::vec2(1024.0f));
         cascade_count =
-            (int)glm::min(glm::floor(glm::log2(4.0f * diagonal) / glm::log2(2.0f)) - 1, (float)cascade_count);
+            glm::ceil(logn(2, (float)rc_push_constants.cascade_extent / glm::sqrt(rc_push_constants.cascade_angular)));
+        MILG_INFO("cascade count {}", cascade_count);
+
+        float diagonal = glm::distance(glm::vec2(0.0f), glm::vec2(render_extent));
+        cascade_count  = (int)glm::min(glm::floor(logn(4.0f, 4.0f * diagonal)) - 1, (float)cascade_count);
+
+        MILG_INFO("cascade count {}", cascade_count);
     }
 
     void on_attach() override {
@@ -187,13 +195,26 @@ public:
         update_cascade_constants();
         auto cascade_descriptions = std::vector<PipelineOutputDescription>();
         for (int i = 0; i < cascade_count; i++) {
-            cascade_descriptions.push_back(PipelineOutputDescription{
-                .format = VK_FORMAT_R8G8B8A8_UNORM, .width = render_extent, .height = render_extent});
+            cascade_descriptions.push_back(PipelineOutputDescription{.format = VK_FORMAT_R8G8B8A8_UNORM,
+                                                                     .width  = (uint32_t)render_extent,
+                                                                     .height = (uint32_t)render_extent});
         }
         MILG_INFO("cascade count {}", cascade_count);
         this->radiance_interval_pipeline =
             this->pipeline_factory->create_compute_pipeline("radiance_interval", "shaders/radiance_interval.comp.spv",
                                                             cascade_descriptions, 3, 0, sizeof(rc_push_constants));
+        this->radiance_merge_pipeline = this->pipeline_factory->create_compute_pipeline(
+            "radiance_merge", "shaders/radiance_merge.comp.spv",
+            {PipelineOutputDescription{.format = VK_FORMAT_R8G8B8A8_UNORM,
+                                       .width  = (uint32_t)render_extent,
+                                       .height = (uint32_t)render_extent}},
+            3, 0, sizeof(rc_push_constants));
+        this->radiance_composite_pipeline = this->pipeline_factory->create_compute_pipeline(
+            "radiance_composite", "shaders/radiance_composite.comp.spv",
+            {PipelineOutputDescription{.format = VK_FORMAT_R8G8B8A8_UNORM,
+                                       .width  = (uint32_t)render_extent / 2,
+                                       .height = (uint32_t)render_extent / 2}},
+            3, 0, sizeof(rc_push_constants));
     }
 
     void on_update(float delta) override {
@@ -228,13 +249,13 @@ public:
 
         Sprite occluder;
         occluder.position = {mouse_position};
-        occluder.color    = {3.0f, 3.0f, 3.0f, 1.0f};
-        occluder.size     = {10, 100};
-        occluder.rotation = time * 5;
+        occluder.color    = {1.0f, 1.0f, 1.0f, 1.0f};
+        occluder.size     = {100, 100};
+        // occluder.rotation = time * 5;
         sprite_batch->draw_sprite(occluder, light_texture, light_texture);
 
-        occluder.rotation = (time + 180) * 5;
-        sprite_batch->draw_sprite(occluder, light_texture, light_texture);
+        // occluder.rotation = (time + 180) * 5;
+        // sprite_batch->draw_sprite(occluder, light_texture, light_texture);
 
         sprite_batch->draw_sprite(s, albedo_texture, emissive_texture);
         sprite_batch->build_batches(command_buffer);
@@ -369,19 +390,84 @@ public:
         {
             auto pipeline      = radiance_interval_pipeline;
             auto df_attachment = distance_field_pipeline->output_buffers[0];
-            auto output        = pipeline->output_buffers[0];
 
-            pipeline->begin(context, command_buffer, sizeof(rc_push_constants), &rc_push_constants);
-            output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+            pipeline->begin(context, command_buffer);
             df_attachment->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
             albedo_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+            for (int i = 0; i < cascade_count; i++) {
+                auto output = pipeline->output_buffers[i];
 
-            pipeline->bind_texture(context, command_buffer, 0, df_attachment);
+                if (i > 0) {
+                    pipeline->allocate_new_set(context);
+                }
+                output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+                pipeline->bind_texture(context, command_buffer, 0, df_attachment);
+                pipeline->bind_texture(context, command_buffer, 1, albedo_buffer);
+                pipeline->bind_texture(context, command_buffer, 2, output);
+                pipeline->rebind_descriptor_set(context, command_buffer);
+
+                rc_push_constants.cascade_index = i;
+                pipeline->set_push_constants(context, command_buffer, sizeof(rc_push_constants), &rc_push_constants);
+                pipeline->dispatch(context, command_buffer, dispatch_size(output->width()),
+                                   dispatch_size(output->height()), 1);
+            }
+            pipeline->end(context, command_buffer);
+        }
+
+        {
+            auto pipeline          = radiance_merge_pipeline;
+            auto interval_pipeline = radiance_interval_pipeline;
+
+            pipeline->begin(context, command_buffer);
+            for (int i = cascade_count - 2; i >= 0; i--) {
+                if (i != cascade_count - 2) {
+                    pipeline->allocate_new_set(context);
+                }
+
+                auto next    = interval_pipeline->output_buffers[(i + 1)];
+                auto current = interval_pipeline->output_buffers[i];
+                auto output  = pipeline->output_buffers[0];
+                output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+                next->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+                current->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+
+                pipeline->bind_texture(context, command_buffer, 0, next);
+                pipeline->bind_texture(context, command_buffer, 1, current);
+                pipeline->bind_texture(context, command_buffer, 2, output);
+                pipeline->rebind_descriptor_set(context, command_buffer);
+
+                rc_push_constants.cascade_index = i;
+                pipeline->set_push_constants(context, command_buffer, sizeof(rc_push_constants), &rc_push_constants);
+                pipeline->dispatch(context, command_buffer, dispatch_size(output->width()),
+                                   dispatch_size(output->height()), 1);
+
+                output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                current->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                current->blit_from(output, command_buffer);
+            }
+            pipeline->end(context, command_buffer);
+        }
+
+        {
+            auto pipeline = radiance_composite_pipeline;
+            auto radiance = radiance_interval_pipeline->output_buffers[0];
+
+            auto output = pipeline->output_buffers[0];
+
+            pipeline->begin(context, command_buffer);
+            output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+            radiance->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+            albedo_buffer->transition_layout(command_buffer, VK_IMAGE_LAYOUT_GENERAL);
+
+            pipeline->bind_texture(context, command_buffer, 0, radiance);
             pipeline->bind_texture(context, command_buffer, 1, albedo_buffer);
             pipeline->bind_texture(context, command_buffer, 2, output);
+            pipeline->rebind_descriptor_set(context, command_buffer);
 
-            context->device_table().vkCmdDispatch(command_buffer, dispatch_size(output->width()),
-                                                  dispatch_size(output->height()), 1);
+            rc_push_constants.cascade_index = 0;
+            pipeline->set_push_constants(context, command_buffer, sizeof(rc_push_constants), &rc_push_constants);
+            pipeline->dispatch(context, command_buffer, dispatch_size(output->width()), dispatch_size(output->height()),
+                               1);
             pipeline->end(context, command_buffer);
 
             output->transition_layout(command_buffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -492,7 +578,7 @@ public:
         //
         // {
         //     auto pipeline  = composite_pipeline;
-        //     auto rt_output = rt_upscale_pipeline->output_buffers[1];
+        //     auto rt_output = radiance_interval_pipeline->output_buffers[0];
         //     auto output    = pipeline->output_buffers[0];
         //
         //     pipeline->begin(context, command_buffer, sizeof(composite_pass_constants), &composite_pass_constants);
@@ -536,6 +622,8 @@ public:
                     update_cascade_constants();
                 }
 
+                ImGui::SliderInt("Active Cascade Index", ((int *)&rc_push_constants.cascade_index), 0, cascade_count);
+
                 ImGui::Separator();
                 ImGui::Text("Cascade count %d", cascade_count);
                 ImGui::Text("Cascade extent %d", rc_push_constants.cascade_extent);
@@ -571,9 +659,10 @@ public:
                 //
                 // ImGui::SeparatorText("Denoise Options");
                 // ImGui::SliderFloat("Sample Count", &rt_upscale_pass_constants.sample_num, 1.0f, 120.0f);
-                // ImGui::SliderFloat("Distribution Bias", &rt_upscale_pass_constants.distribution_bias, 0.0f, 1.0f);
-                // ImGui::SliderFloat("Pixel Multiplier", &rt_upscale_pass_constants.pixel_multiplier, 1.0f, 3.0f);
-                // ImGui::SliderFloat("Iverse Hue Tolerance", &rt_upscale_pass_constants.inverse_hue_tolerance, 2.0f,
+                // ImGui::SliderFloat("Distribution Bias", &rt_upscale_pass_constants.distribution_bias,
+                // 0.0f, 1.0f); ImGui::SliderFloat("Pixel Multiplier",
+                // &rt_upscale_pass_constants.pixel_multiplier, 1.0f, 3.0f); ImGui::SliderFloat("Iverse Hue
+                // Tolerance", &rt_upscale_pass_constants.inverse_hue_tolerance, 2.0f,
                 //                    30.0f);
 
                 ImGui::EndTabItem();
@@ -631,8 +720,8 @@ public:
 int main(int argc, char **argv) {
     WindowCreateInfo window_info = {
         .title  = "Milg",
-        .width  = 1600,
-        .height = 900,
+        .width  = 1024,
+        .height = 1024,
     };
 
     GraphicsPlayground app(argc, argv, window_info);
